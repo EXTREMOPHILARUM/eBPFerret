@@ -6,6 +6,7 @@ from bcc import BPF
 import socket
 import struct
 import ctypes as ct
+import os
 
 # Define constants for event types
 EVENT_EXECVE = 1
@@ -23,116 +24,8 @@ def parse_arguments():
     return parser.parse_args()
 
 def load_ebpf_program():
-    bpf_text = """
-    #include <uapi/linux/ptrace.h>
-    #include <net/sock.h>
-    #include <linux/fs.h>
-    #include <linux/sched.h>
-    #include <linux/blkdev.h>
-
-    BPF_PERF_OUTPUT(events);
-
-    struct data_t {
-        u32 pid;
-        char comm[TASK_COMM_LEN];
-        u32 event_type;
-        union {
-            char filename[128];  // Used for EVENT_EXECVE, EVENT_OPEN
-            struct {
-                u16 dport;
-                u32 daddr;
-            };
-            u64 syscall;         // Used for EVENT_SYSCALL
-            int capability;      // Used for EVENT_CAPABILITY
-            char module[128];    // Used for EVENT_KERNEL_MODULE_LOAD
-            // Add other event-specific fields as needed
-        };
-    };
-
-    enum event_types {
-        EVENT_EXECVE = 1,
-        EVENT_OPEN,
-        EVENT_CONNECT,
-        EVENT_SYSCALL,
-        EVENT_CAPABILITY,
-        EVENT_KERNEL_MODULE_LOAD,
-        // Add other event types as needed
-    };
-
-    // Trace execve syscalls
-    TRACEPOINT_PROBE(syscalls, sys_enter_execve) {
-        struct data_t data = {};
-        data.event_type = EVENT_EXECVE;
-        data.pid = bpf_get_current_pid_tgid() >> 32;
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
-        bpf_probe_read_user_str(&data.filename, sizeof(data.filename), args->filename);
-        events.perf_submit(args, &data, sizeof(data));
-        return 0;
-    }
-
-    // Trace file open syscalls
-    TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
-        struct data_t data = {};
-        data.event_type = EVENT_OPEN;
-        data.pid = bpf_get_current_pid_tgid() >> 32;
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
-        bpf_probe_read_user_str(&data.filename, sizeof(data.filename), args->filename);
-        events.perf_submit(args, &data, sizeof(data));
-        return 0;
-    }
-
-    // Trace network connect syscalls
-    int kprobe__tcp_v4_connect(struct pt_regs *ctx, struct sock *sk) {
-        struct data_t data = {};
-        u16 family = 0;
-        data.event_type = EVENT_CONNECT;
-        data.pid = bpf_get_current_pid_tgid() >> 32;
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
-        bpf_probe_read_kernel(&family, sizeof(family), &sk->__sk_common.skc_family);
-        if (family == AF_INET) {
-            bpf_probe_read_kernel(&data.daddr, sizeof(data.daddr), &sk->__sk_common.skc_daddr);
-            bpf_probe_read_kernel(&data.dport, sizeof(data.dport), &sk->__sk_common.skc_dport);
-            events.perf_submit(ctx, &data, sizeof(data));
-        }
-        return 0;
-    }
-
-    // Trace syscalls
-    TRACEPOINT_PROBE(raw_syscalls, sys_enter) {
-        struct data_t data = {};
-        data.event_type = EVENT_SYSCALL;
-        data.pid = bpf_get_current_pid_tgid() >> 32;
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
-        data.syscall = args->id;
-        events.perf_submit(args, &data, sizeof(data));
-        return 0;
-    }
-
-    // Trace capability checks
-    int kprobe__cap_capable(struct pt_regs *ctx, const struct cred *cred, struct user_namespace *ns, int cap, int audit) {
-        struct data_t data = {};
-        data.event_type = EVENT_CAPABILITY;
-        data.pid = bpf_get_current_pid_tgid() >> 32;
-        data.capability = cap;
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
-        events.perf_submit(ctx, &data, sizeof(data));
-        return 0;
-    }
-
-    // Trace kernel module loads
-    int kprobe__security_kernel_module_request(struct pt_regs *ctx, char *kmod_name) {
-        struct data_t data = {};
-        data.event_type = EVENT_KERNEL_MODULE_LOAD;
-        data.pid = bpf_get_current_pid_tgid() >> 32;
-        bpf_probe_read_kernel_str(&data.module, sizeof(data.module), kmod_name);
-        bpf_get_current_comm(&data.comm, sizeof(data.comm));
-        events.perf_submit(ctx, &data, sizeof(data));
-        return 0;
-    }
-
-    // Additional probes would be added here, following the same pattern.
-
-    """
+    with open("ebpf_program.c", "r") as f:
+        bpf_text = f.read()
     return BPF(text=bpf_text)
 
 def ip_to_str(ip):
@@ -145,7 +38,51 @@ class Data(ct.Structure):
         ('comm', ct.c_char * 16),
         ('event_type', ct.c_uint32),
         ('data', ct.c_byte * 128),  # Maximum size of the union fields
+        ('flags', ct.c_int),
     ]
+
+def capability_name(cap):
+    cap_names = {
+        0: 'CAP_CHOWN',
+        1: 'CAP_DAC_OVERRIDE',
+        2: 'CAP_DAC_READ_SEARCH',
+        3: 'CAP_FOWNER',
+        4: 'CAP_FSETID',
+        5: 'CAP_KILL',
+        6: 'CAP_SETGID',
+        7: 'CAP_SETUID',
+        8: 'CAP_SETPCAP',
+        9: 'CAP_LINUX_IMMUTABLE',
+        10: 'CAP_NET_BIND_SERVICE',
+        11: 'CAP_NET_BROADCAST',
+        12: 'CAP_NET_ADMIN',
+        13: 'CAP_NET_RAW',
+        14: 'CAP_IPC_LOCK',
+        15: 'CAP_IPC_OWNER',
+        16: 'CAP_SYS_MODULE',
+        17: 'CAP_SYS_RAWIO',
+        18: 'CAP_SYS_CHROOT',
+        19: 'CAP_SYS_PTRACE',
+        20: 'CAP_SYS_PACCT',
+        21: 'CAP_SYS_ADMIN',
+        22: 'CAP_SYS_BOOT',
+        23: 'CAP_SYS_NICE',
+        24: 'CAP_SYS_RESOURCE',
+        25: 'CAP_SYS_TIME',
+        26: 'CAP_SYS_TTY_CONFIG',
+        27: 'CAP_MKNOD',
+        28: 'CAP_LEASE',
+        29: 'CAP_AUDIT_WRITE',
+        30: 'CAP_AUDIT_CONTROL',
+        31: 'CAP_SETFCAP',
+        32: 'CAP_MAC_OVERRIDE',
+        33: 'CAP_MAC_ADMIN',
+        34: 'CAP_SYSLOG',
+        35: 'CAP_WAKE_ALARM',
+        36: 'CAP_BLOCK_SUSPEND',
+        37: 'CAP_AUDIT_READ',
+    }
+    return cap_names.get(cap, f'UNKNOWN({cap})')
 
 def learning_mode(b, duration, config_path):
     events = defaultdict(list)
@@ -158,22 +95,20 @@ def learning_mode(b, duration, config_path):
             events['execve'].append(filename)
         elif event.event_type == EVENT_OPEN:
             filename = bytes(event.data[:128]).rstrip(b'\x00').decode('utf-8', 'replace')
-            events['open'].append(filename)
+            flags = event.flags
+            events['open'].append((filename, flags))
         elif event.event_type == EVENT_CONNECT:
             dport = ct.cast(event.data, ct.POINTER(ct.c_uint16)).contents.value
             daddr = ct.cast(ct.byref(event.data, 2), ct.POINTER(ct.c_uint32)).contents.value
             daddr_str = ip_to_str(daddr)
             dport = socket.ntohs(dport)
-            dest = f"{daddr_str}:{dport}"
+            dest = {'ip': daddr_str, 'port': dport}
             events['connect'].append(dest)
-        elif event.event_type == EVENT_SYSCALL:
-            syscall = ct.cast(event.data, ct.POINTER(ct.c_uint64)).contents.value
-            events['syscall'].append(syscall)
         elif event.event_type == EVENT_CAPABILITY:
             capability = ct.cast(event.data, ct.POINTER(ct.c_int)).contents.value
             events['capability'].append(capability)
         elif event.event_type == EVENT_KERNEL_MODULE_LOAD:
-            module = bytes(event.data[:128]).rstrip(b'\x00').decode('utf-8', 'replace')
+            module = bytes(event.data[:56]).rstrip(b'\x00').decode('utf-8', 'replace')
             events['kernel_module_load'].append(module)
         # Handle other event types as needed
 
@@ -185,35 +120,62 @@ def learning_mode(b, duration, config_path):
     # Generate allowlist
     allowlist = {"allowlist": {}}
 
-    # Execve allowlist
+    # Syscalls allowlist
+    syscalls = []
     execve_counts = Counter(events['execve'])
     execve_common = [fname for fname, count in execve_counts.items() if count > 1]
-    allowlist["allowlist"]["execve"] = {"paths": execve_common}
+    if execve_common:
+        syscalls.append({
+            'name': 'execve',
+            'paths': execve_common
+        })
 
-    # Open allowlist
+    # Filesystem allowlist
+    filesystem = {'read': set(), 'write': set()}
     open_counts = Counter(events['open'])
-    open_common = [fname for fname, count in open_counts.items() if count > 1]
-    allowlist["allowlist"]["open"] = {"paths": open_common}
+    for (fname, flags), count in open_counts.items():
+        if count > 1:
+            # Determine if it's a read or write based on flags
+            if flags & os.O_WRONLY or flags & os.O_RDWR:
+                filesystem['write'].add(fname)
+            else:
+                filesystem['read'].add(fname)
 
-    # Connect allowlist
-    connect_counts = Counter(events['connect'])
-    connect_common = [dest for dest, count in connect_counts.items() if count > 1]
-    allowlist["allowlist"]["connect"] = {"destinations": connect_common}
+    # Convert sets to lists
+    filesystem['read'] = list(filesystem['read'])
+    filesystem['write'] = list(filesystem['write'])
 
-    # Syscall allowlist
-    syscall_counts = Counter(events['syscall'])
-    syscall_common = [syscall for syscall, count in syscall_counts.items() if count > 1]
-    allowlist["allowlist"]["syscalls"] = syscall_common
+    # Network allowlist
+    network = {'outbound': [], 'inbound': []}
+    # For outbound connections
+    connect_counts = Counter([ (dest['ip'], dest['port']) for dest in events['connect'] ])
+    outbound_dict = {}
+    for (ip, port), count in connect_counts.items():
+        if count > 1:
+            if ip not in outbound_dict:
+                outbound_dict[ip] = set()
+            outbound_dict[ip].add(port)
+    for ip, ports in outbound_dict.items():
+        network['outbound'].append({
+            'destination_ip': ip,
+            'ports': list(ports)
+        })
 
-    # Capability allowlist
+    # Capabilities allowlist
     capability_counts = Counter(events['capability'])
-    capability_common = [capability for capability, count in capability_counts.items() if count > 1]
-    allowlist["allowlist"]["capabilities"] = capability_common
+    capabilities_common = [cap for cap, count in capability_counts.items() if count > 1]
+    capabilities_names = [capability_name(cap) for cap in capabilities_common]
+    allowlist['allowlist']['capabilities'] = capabilities_names
 
-    # Kernel module load allowlist
-    kernel_module_load_counts = Counter(events['kernel_module_load'])
-    kernel_module_load_common = [module for module, count in kernel_module_load_counts.items() if count > 1]
-    allowlist["allowlist"]["kernel_modules"] = kernel_module_load_common
+    # Kernel modules allowlist
+    module_counts = Counter(events['kernel_module_load'])
+    modules_common = [module for module, count in module_counts.items() if count > 1]
+    allowlist['allowlist']['kernel_modules'] = modules_common
+
+    # Assemble the allowlist
+    allowlist['allowlist']['syscalls'] = syscalls
+    allowlist['allowlist']['filesystem'] = filesystem
+    allowlist['allowlist']['network'] = network
 
     # Save allowlist to YAML
     with open(config_path, "w") as f:
@@ -226,41 +188,66 @@ def enforcement_mode(b, config_path):
     with open(config_path, "r") as f:
         allowlist = yaml.safe_load(f)
 
-    execve_allowed = set(allowlist["allowlist"].get("execve", {}).get("paths", []))
-    open_allowed = set(allowlist["allowlist"].get("open", {}).get("paths", []))
-    connect_allowed = set(allowlist["allowlist"].get("connect", {}).get("destinations", []))
-    allowed_syscalls = set(allowlist["allowlist"].get("syscalls", []))
-    allowed_capabilities = set(allowlist["allowlist"].get("capabilities", []))
-    allowed_kernel_modules = set(allowlist["allowlist"].get("kernel_modules", []))
+    # Extract allowed syscalls
+    allowed_syscalls = {}
+    for syscall in allowlist['allowlist'].get('syscalls', []):
+        name = syscall['name']
+        paths = set(syscall.get('paths', []))
+        allowed_syscalls[name] = paths
 
+    # Extract allowed filesystem accesses
+    fs_read_allowed = set(allowlist['allowlist'].get('filesystem', {}).get('read', []))
+    fs_write_allowed = set(allowlist['allowlist'].get('filesystem', {}).get('write', []))
+
+    # Extract allowed network connections
+    outbound_allowed = []
+    for entry in allowlist['allowlist'].get('network', {}).get('outbound', []):
+        ip = entry.get('destination_ip')
+        ports = set(entry.get('ports', []))
+        outbound_allowed.append({'ip': ip, 'ports': ports})
+
+    # Extract allowed capabilities
+    allowed_capabilities = set(allowlist['allowlist'].get('capabilities', []))
+
+    # Extract allowed kernel modules
+    allowed_kernel_modules = set(allowlist['allowlist'].get('kernel_modules', []))
+
+    # Define enforcement functions
     def enforce_policy(cpu, data, size):
         event = ct.cast(data, ct.POINTER(Data)).contents
         if event.event_type == EVENT_EXECVE:
             filename = bytes(event.data[:128]).rstrip(b'\x00').decode('utf-8', 'replace')
-            if filename not in execve_allowed:
-                print(f"ALERT: Unexpected process launched: {filename}")
+            allowed_paths = allowed_syscalls.get('execve', set())
+            if filename not in allowed_paths:
+                print(f"ALERT: Unauthorized execve call detected: {filename}")
         elif event.event_type == EVENT_OPEN:
             filename = bytes(event.data[:128]).rstrip(b'\x00').decode('utf-8', 'replace')
-            if filename not in open_allowed:
-                print(f"ALERT: Unexpected file access: {filename}")
+            flags = event.flags
+            if flags & os.O_WRONLY or flags & os.O_RDWR:
+                if filename not in fs_write_allowed:
+                    print(f"ALERT: Unauthorized write access detected: {filename}")
+            else:
+                if filename not in fs_read_allowed:
+                    print(f"ALERT: Unauthorized read access detected: {filename}")
         elif event.event_type == EVENT_CONNECT:
             dport = ct.cast(event.data, ct.POINTER(ct.c_uint16)).contents.value
             daddr = ct.cast(ct.byref(event.data, 2), ct.POINTER(ct.c_uint32)).contents.value
             daddr_str = ip_to_str(daddr)
-            dport = socket.ntohs(dport)
-            dest = f"{daddr_str}:{dport}"
-            if dest not in connect_allowed:
-                print(f"ALERT: Unexpected network connection: {dest}")
-        elif event.event_type == EVENT_SYSCALL:
-            syscall = ct.cast(event.data, ct.POINTER(ct.c_uint64)).contents.value
-            if syscall not in allowed_syscalls:
-                print(f"ALERT: Unexpected system call: {syscall}")
+            dport_host = socket.ntohs(dport)
+            allowed = False
+            for entry in outbound_allowed:
+                if entry['ip'] == daddr_str and dport_host in entry['ports']:
+                    allowed = True
+                    break
+            if not allowed:
+                print(f"ALERT: Unauthorized network connection to {daddr_str}:{dport_host}")
         elif event.event_type == EVENT_CAPABILITY:
             capability = ct.cast(event.data, ct.POINTER(ct.c_int)).contents.value
-            if capability not in allowed_capabilities:
-                print(f"ALERT: Unexpected capability used: {capability}")
+            cap_name = capability_name(capability)
+            if cap_name not in allowed_capabilities:
+                print(f"ALERT: Unauthorized capability used: {cap_name}")
         elif event.event_type == EVENT_KERNEL_MODULE_LOAD:
-            module = bytes(event.data[:128]).rstrip(b'\x00').decode('utf-8', 'replace')
+            module = bytes(event.data[:56]).rstrip(b'\x00').decode('utf-8', 'replace')
             if module not in allowed_kernel_modules:
                 print(f"ALERT: Unauthorized kernel module load: {module}")
         # Handle other event types as needed
