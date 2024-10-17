@@ -15,6 +15,7 @@ EVENT_CONNECT = 3
 EVENT_SYSCALL = 4
 EVENT_CAPABILITY = 5
 EVENT_KERNEL_MODULE_LOAD = 6
+EVENT_ACCEPT = 7
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="eBPF-based Threat Detection Engine")
@@ -23,10 +24,23 @@ def parse_arguments():
     parser.add_argument("--duration", type=int, default=60, help="Learning duration in seconds")
     return parser.parse_args()
 
-def load_ebpf_program():
-    with open("ebpf_program.c", "r") as f:
-        bpf_text = f.read()
-    return BPF(text=bpf_text)
+def load_ebpf_programs():
+    with open("ebpf/filesystem.c", "r") as f:
+        bpf_filesystem = BPF(text=f.read())
+    with open("ebpf/network.c", "r") as f:
+        bpf_network = BPF(text=f.read())
+    with open("ebpf/syscalls.c", "r") as f:
+        bpf_syscalls = BPF(text=f.read())
+    
+    # Attach XDP program to a network interface (e.g., eth0)
+    try:
+        function_xdp_prog = bpf_network.load_func("xdp_prog", BPF.XDP)
+        bpf_network.attach_xdp("wlan0", function_xdp_prog)
+    except Exception as e:
+        print(f"Failed to attach XDP program: {e}")
+        print("Continuing without XDP...")
+    
+    return bpf_filesystem, bpf_network, bpf_syscalls
 
 def ip_to_str(ip):
     return socket.inet_ntoa(struct.pack('!I', ip))
@@ -37,8 +51,22 @@ class Data(ct.Structure):
         ('pid', ct.c_uint32),
         ('comm', ct.c_char * 16),
         ('event_type', ct.c_uint32),
-        ('data', ct.c_byte * 128),  # Maximum size of the union fields
+        ('direction', ct.c_uint8),
+        ('filename', ct.c_char * 128),  # Add this line
+        ('sport', ct.c_uint16),
+        ('dport', ct.c_uint16),
+        ('saddr', ct.c_uint32),
+        ('daddr', ct.c_uint32),
         ('flags', ct.c_int),
+    ]
+
+class XdpData(ct.Structure):
+    _fields_ = [
+        ('src_ip', ct.c_uint32),
+        ('dst_ip', ct.c_uint32),
+        ('src_port', ct.c_uint16),
+        ('dst_port', ct.c_uint16),
+        ('protocol', ct.c_uint8),
     ]
 
 def capability_name(cap):
@@ -84,38 +112,56 @@ def capability_name(cap):
     }
     return cap_names.get(cap, f'UNKNOWN({cap})')
 
-def learning_mode(b, duration, config_path):
+def learning_mode(bpf_programs, duration, config_path):
+    bpf_filesystem, bpf_network, bpf_syscalls = bpf_programs
     events = defaultdict(list)
     start_time = time.time()
 
     def collect_event(cpu, data, size):
         event = ct.cast(data, ct.POINTER(Data)).contents
         if event.event_type == EVENT_EXECVE:
-            filename = bytes(event.data[:128]).rstrip(b'\x00').decode('utf-8', 'replace')
+            filename = event.filename.decode('utf-8', 'replace').rstrip('\0')
             events['execve'].append(filename)
         elif event.event_type == EVENT_OPEN:
-            filename = bytes(event.data[:128]).rstrip(b'\x00').decode('utf-8', 'replace')
+            filename = event.filename.decode('utf-8', 'replace').rstrip('\0')
             flags = event.flags
             events['open'].append((filename, flags))
-        elif event.event_type == EVENT_CONNECT:
-            dport = ct.cast(event.data, ct.POINTER(ct.c_uint16)).contents.value
-            daddr = ct.cast(ct.byref(event.data, 2), ct.POINTER(ct.c_uint32)).contents.value
-            daddr_str = ip_to_str(daddr)
-            dport = socket.ntohs(dport)
-            dest = {'ip': daddr_str, 'port': dport}
-            events['connect'].append(dest)
-        elif event.event_type == EVENT_CAPABILITY:
-            capability = ct.cast(event.data, ct.POINTER(ct.c_int)).contents.value
-            events['capability'].append(capability)
-        elif event.event_type == EVENT_KERNEL_MODULE_LOAD:
-            module = bytes(event.data[:56]).rstrip(b'\x00').decode('utf-8', 'replace')
-            events['kernel_module_load'].append(module)
-        # Handle other event types as needed
+        elif event.event_type in (EVENT_CONNECT, EVENT_ACCEPT):
+            saddr_str = socket.inet_ntoa(struct.pack('!I', event.saddr))
+            daddr_str = socket.inet_ntoa(struct.pack('!I', event.daddr))
+            sport = socket.ntohs(event.sport)
+            dport = socket.ntohs(event.dport)
+            connection = {
+                'source_ip': saddr_str,
+                'source_port': sport,
+                'destination_ip': daddr_str,
+                'destination_port': dport,
+                'direction': 'inbound' if event.direction == 1 else 'outbound'
+            }
+            events['network'].append(connection)
+        elif event.event_type == XDP_EVENT:
+            xdp_data = ct.cast(data, ct.POINTER(XdpData)).contents
+            src_ip = socket.inet_ntoa(struct.pack('!I', xdp_data.src_ip))
+            dst_ip = socket.inet_ntoa(struct.pack('!I', xdp_data.dst_ip))
+            src_port = socket.ntohs(xdp_data.src_port)
+            dst_port = socket.ntohs(xdp_data.dst_port)
+            connection = {
+                'source_ip': src_ip,
+                'source_port': src_port,
+                'destination_ip': dst_ip,
+                'destination_port': dst_port,
+                'protocol': xdp_data.protocol
+            }
+            events['xdp_network'].append(connection)
 
-    b["events"].open_perf_buffer(collect_event)
+    bpf_filesystem["events"].open_perf_buffer(collect_event)
+    bpf_network["events"].open_perf_buffer(collect_event)
+    bpf_syscalls["events"].open_perf_buffer(collect_event)
 
     while time.time() - start_time < duration:
-        b.perf_buffer_poll(timeout=100)
+        bpf_filesystem.perf_buffer_poll(timeout=100)
+        bpf_network.perf_buffer_poll(timeout=100)
+        bpf_syscalls.perf_buffer_poll(timeout=100)
 
     # Generate allowlist
     allowlist = {"allowlist": {}}
@@ -173,9 +219,15 @@ def learning_mode(b, duration, config_path):
     allowlist['allowlist']['kernel_modules'] = modules_common
 
     # Assemble the allowlist
-    allowlist['allowlist']['syscalls'] = syscalls
-    allowlist['allowlist']['filesystem'] = filesystem
-    allowlist['allowlist']['network'] = network
+    allowlist['allowlist']['syscalls'] = [s for s in syscalls if s['paths']]
+    allowlist['allowlist']['filesystem'] = {
+        'read': [f for f in filesystem['read'] if f.strip()],
+        'write': [f for f in filesystem['write'] if f.strip()]
+    }
+    allowlist['allowlist']['network'] = {
+        'outbound': [n for n in network['outbound'] if n['destination_ip'].strip() and n['ports']],
+        'inbound': [n for n in network['inbound'] if n['source_ip'].strip() and n['ports']]
+    }
 
     # Save allowlist to YAML
     with open(config_path, "w") as f:
@@ -216,12 +268,12 @@ def enforcement_mode(b, config_path):
     def enforce_policy(cpu, data, size):
         event = ct.cast(data, ct.POINTER(Data)).contents
         if event.event_type == EVENT_EXECVE:
-            filename = bytes(event.data[:128]).rstrip(b'\x00').decode('utf-8', 'replace')
+            filename = event.filename.decode('utf-8', 'replace').rstrip('\0')
             allowed_paths = allowed_syscalls.get('execve', set())
             if filename not in allowed_paths:
                 print(f"ALERT: Unauthorized execve call detected: {filename}")
         elif event.event_type == EVENT_OPEN:
-            filename = bytes(event.data[:128]).rstrip(b'\x00').decode('utf-8', 'replace')
+            filename = event.filename.decode('utf-8', 'replace').rstrip('\0')
             flags = event.flags
             if flags & os.O_WRONLY or flags & os.O_RDWR:
                 if filename not in fs_write_allowed:
@@ -247,7 +299,7 @@ def enforcement_mode(b, config_path):
             if cap_name not in allowed_capabilities:
                 print(f"ALERT: Unauthorized capability used: {cap_name}")
         elif event.event_type == EVENT_KERNEL_MODULE_LOAD:
-            module = bytes(event.data[:56]).rstrip(b'\x00').decode('utf-8', 'replace')
+            module = bytes(event.filename[:56]).rstrip(b'\x00').decode('utf-8', 'replace')
             if module not in allowed_kernel_modules:
                 print(f"ALERT: Unauthorized kernel module load: {module}")
         # Handle other event types as needed
@@ -261,12 +313,12 @@ def enforcement_mode(b, config_path):
 
 def main():
     args = parse_arguments()
-    b = load_ebpf_program()
+    bpf_programs = load_ebpf_programs()
 
     if args.mode == "learning":
-        learning_mode(b, args.duration, args.config)
+        learning_mode(bpf_programs, args.duration, args.config)
     elif args.mode == "enforcement":
-        enforcement_mode(b, args.config)
+        enforcement_mode(bpf_programs, args.config)
 
 if __name__ == "__main__":
     main()
