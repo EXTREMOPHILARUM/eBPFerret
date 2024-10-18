@@ -1,5 +1,3 @@
-Here's a README for the project:
-
 # eBPF Security Monitoring Tool
 
 This project is an advanced security monitoring tool that leverages eBPF (extended Berkeley Packet Filter) technology to provide real-time system activity monitoring and threat detection.
