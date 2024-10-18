@@ -1,0 +1,27 @@
+learning_mode: false
+rules:
+  0:
+    capability_use:
+    - None
+    ebpf_program_load:
+    - python3
+    process_launch:
+    - systemd-userwor
+    syscall:
+    - syscall_346259288
+  1000:
+    capability_use:
+    - None
+    process_launch:
+    - cat
+    - sh
+    - which
+    - sed
+    - ps
+    - cpuUsage.sh
+    - sleep
+    syscall:
+    - syscall_346816344
+    - syscall_346783576
+    - syscall_346324824
+    - syscall_346881880
